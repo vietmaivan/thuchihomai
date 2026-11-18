@@ -4,9 +4,9 @@
  * ============================================================================
  * Ho tro ket noi TRUC TIEP tu Web tinh (GitHub Pages) va tu Backend Express.
  * Bao mat:
- * - Mat khau trong tab LOGIN KHONG BAO GIO duoc tra ve qua mang (luon an ••••••••).
- * - Xac thuc Admin bang HMAC-SHA256 Token co chu ky so & khoa 1 gio neu sai 3 lan.
- * - Moi thao tac ghi/sua/xoa/dong bo deu bat buoc co Admin Token hop le.
+ * - Khong doc, khong dong bo va khong lo bat ky du lieu nao tu tab LOGIN.
+ * - Xac thuc Admin 100% qua Firebase Realtime Database (thuchihomai/sessions).
+ * - Moi thao tac ghi/sua/xoa/dong bo deu bat buoc co firebaseSessionId Admin hop le.
  *
  * Huong dan trien khai nhanh:
  * 1. Mo Google Sheet "THU CHI QUY HO MAI" cua ban.
@@ -23,9 +23,8 @@
  */
 
 var DEFAULT_SPREADSHEET_ID = '1gONqBiPvTUsNThDZg6y8nCxmRueiRUsXEm8o5C_rB84';
-var CODE_GS_VERSION = '2026.09.github-web';
-var MAX_LOGIN_ATTEMPTS = 3;
-var LOCKOUT_DURATION_MS = 60 * 60 * 1000; // 1 gio
+var FIREBASE_RTDB_URL = 'https://thuchihomai-default-rtdb.firebaseio.com';
+var CODE_GS_VERSION = '2026.11.firebase-auth';
 var DEFAULT_BACKGROUND_URL = '/src/assets/images/ho_mai_backdrop_1794969196398.jpg';
 
 function getSpreadsheet_() {
@@ -57,224 +56,35 @@ function jsonResponse_(data) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-function maskLoginSheet_(doc) {
-  if (!doc) return doc;
-  if (doc.category === 'LOGIN' || String(doc.name || '').toUpperCase() === 'LOGIN') {
-    var masked = {};
-    for (var k in doc) {
-      if (Object.prototype.hasOwnProperty.call(doc, k)) masked[k] = doc[k];
-    }
-    masked.rows = (doc.rows || []).map(function(r) {
-      return {
-        id: r.id,
-        stt: r.stt,
-        name: r.name,
-        user: r.user,
-        password: '••••••••',
-        role: r.role
-      };
+function isLoginSheetName_(name) {
+  return String(name || '').toUpperCase().trim() === 'LOGIN';
+}
+
+function verifyFirebaseAdminSession_(sessionId) {
+  var cleanSid = String(sessionId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!cleanSid || cleanSid.length < 16) return null;
+  try {
+    var url = FIREBASE_RTDB_URL + '/thuchihomai/sessions/' + encodeURIComponent(cleanSid) + '.json';
+    var res = UrlFetchApp.fetch(url, {
+      method: 'get',
+      muteHttpExceptions: true
     });
-    return masked;
-  }
-  return doc;
-}
-
-function getSigningKey_() {
-  var props = PropertiesService.getScriptProperties();
-  var key = props.getProperty('HO_MAI_SIGNING_KEY');
-  if (!key || key.length < 32) {
-    key = Utilities.getUuid() + '-' + Utilities.getUuid() + '-' + new Date().getTime();
-    props.setProperty('HO_MAI_SIGNING_KEY', key);
-  }
-  return key;
-}
-
-function toBase64Url_(bytes) {
-  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/, '');
-}
-
-function fromBase64UrlToString_(b64url) {
-  var b64 = String(b64url || '').replace(/-/g, '+').replace(/_/g, '/');
-  while (b64.length % 4 !== 0) b64 += '=';
-  return Utilities.newBlob(Utilities.base64Decode(b64)).getDataAsString('UTF-8');
-}
-
-function safeEqualStr_(a, b) {
-  var sa = String(a === undefined || a === null ? '' : a);
-  var sb = String(b === undefined || b === null ? '' : b);
-  var len = Math.max(sa.length, sb.length);
-  var diff = sa.length ^ sb.length;
-  for (var i = 0; i < len; i++) {
-    var ca = i < sa.length ? sa.charCodeAt(i) : 0;
-    var cb = i < sb.length ? sb.charCodeAt(i) : 0;
-    diff |= (ca ^ cb);
-  }
-  return diff === 0;
-}
-
-function isTokenRevoked_(jti) {
-  if (!jti) return false;
-  var props = PropertiesService.getScriptProperties();
-  var raw = props.getProperty('HO_MAI_REVOKED_TOKENS');
-  if (!raw) return false;
-  try {
-    var map = JSON.parse(raw);
-    return Boolean(map[jti] && map[jti] > new Date().getTime());
-  } catch (e) {
-    return false;
-  }
-}
-
-function revokeTokenId_(jti, exp) {
-  if (!jti) return;
-  var props = PropertiesService.getScriptProperties();
-  var now = new Date().getTime();
-  var map = {};
-  try {
-    var raw = props.getProperty('HO_MAI_REVOKED_TOKENS');
-    if (raw) map = JSON.parse(raw) || {};
-  } catch (e) {}
-  map[jti] = exp || (now + 30 * 24 * 60 * 60 * 1000);
-  var cleaned = {};
-  for (var k in map) {
-    if (Object.prototype.hasOwnProperty.call(map, k) && map[k] > now) {
-      cleaned[k] = map[k];
-    }
-  }
-  props.setProperty('HO_MAI_REVOKED_TOKENS', JSON.stringify(cleaned));
-}
-
-function signAdminToken_(user, rememberMe) {
-  var now = new Date().getTime();
-  var ttl = rememberMe ? (30 * 24 * 60 * 60 * 1000) : (8 * 60 * 60 * 1000);
-  var payloadObj = {
-    id: user.id,
-    name: user.name,
-    user: user.user,
-    role: 'admin',
-    jti: Utilities.getUuid(),
-    iat: now,
-    exp: now + ttl
-  };
-  var payloadBytes = Utilities.newBlob(JSON.stringify(payloadObj)).getBytes();
-  var payloadB64 = toBase64Url_(payloadBytes);
-  var sigBytes = Utilities.computeHmacSha256Signature(payloadB64, getSigningKey_());
-  var sigB64 = toBase64Url_(sigBytes);
-  return payloadB64 + '.' + sigB64;
-}
-
-function verifyAdminToken_(token) {
-  if (!token || typeof token !== 'string') return null;
-  var parts = token.split('.');
-  if (parts.length !== 2) return null;
-  var payloadB64 = parts[0];
-  var sigB64 = parts[1];
-  var expectedBytes = Utilities.computeHmacSha256Signature(payloadB64, getSigningKey_());
-  var expectedB64 = toBase64Url_(expectedBytes);
-  if (!safeEqualStr_(sigB64, expectedB64)) return null;
-  try {
-    var decoded = JSON.parse(fromBase64UrlToString_(payloadB64));
-    if (!decoded || typeof decoded.exp !== 'number' || new Date().getTime() > decoded.exp) {
-      return null;
-    }
-    if (decoded.role !== 'admin') return null;
-    if (isTokenRevoked_(decoded.jti)) return null;
+    if (res.getResponseCode() !== 200) return null;
+    var raw = res.getContentText();
+    if (!raw || raw === 'null') return null;
+    var sess = JSON.parse(raw);
+    if (!sess || sess.role !== 'admin') return null;
+    if (typeof sess.exp !== 'number' || new Date().getTime() > sess.exp) return null;
     return {
+      sid: cleanSid,
       user: {
-        id: decoded.id,
-        name: decoded.name,
-        user: decoded.user,
+        name: sess.name || sess.user || 'Admin',
+        user: sess.user || '',
         role: 'admin'
-      },
-      jti: decoded.jti,
-      exp: decoded.exp
+      }
     };
   } catch (e) {
     return null;
-  }
-}
-
-function normalizeClientKey_(clientId) {
-  var clean = String(clientId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
-  return 'cid_' + (clean || 'default');
-}
-
-function getLockoutMap_() {
-  var raw = PropertiesService.getScriptProperties().getProperty('HO_MAI_LOCKOUTS');
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw) || {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function saveLockoutMap_(map) {
-  PropertiesService.getScriptProperties().setProperty('HO_MAI_LOCKOUTS', JSON.stringify(map));
-}
-
-function getLockStatus_(clientId) {
-  var key = normalizeClientKey_(clientId);
-  var map = getLockoutMap_();
-  var rec = map[key];
-  var now = new Date().getTime();
-  if (rec && rec.lockedUntil && now < rec.lockedUntil) {
-    return {
-      locked: true,
-      attempts: Math.max(rec.attempts || MAX_LOGIN_ATTEMPTS, MAX_LOGIN_ATTEMPTS),
-      remainingAttempts: 0,
-      lockedUntil: rec.lockedUntil,
-      remainingSeconds: Math.ceil((rec.lockedUntil - now) / 1000)
-    };
-  }
-  if (rec && rec.lockedUntil && now >= rec.lockedUntil) {
-    delete map[key];
-    saveLockoutMap_(map);
-    rec = null;
-  }
-  var attempts = rec && rec.attempts ? Number(rec.attempts) : 0;
-  return {
-    locked: false,
-    attempts: attempts,
-    remainingAttempts: Math.max(0, MAX_LOGIN_ATTEMPTS - attempts),
-    lockedUntil: null,
-    remainingSeconds: 0
-  };
-}
-
-function recordFailedAttempt_(clientId) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(5000);
-  try {
-    var key = normalizeClientKey_(clientId);
-    var map = getLockoutMap_();
-    var rec = map[key] || { attempts: 0, lockedUntil: null };
-    var now = new Date().getTime();
-    if (rec.lockedUntil && now < rec.lockedUntil) {
-      return getLockStatus_(clientId);
-    }
-    var nextAttempts = Number(rec.attempts || 0) + 1;
-    var lockedUntil = nextAttempts >= MAX_LOGIN_ATTEMPTS ? (now + LOCKOUT_DURATION_MS) : null;
-    map[key] = { attempts: nextAttempts, lockedUntil: lockedUntil };
-    saveLockoutMap_(map);
-    return {
-      locked: Boolean(lockedUntil),
-      attempts: nextAttempts,
-      remainingAttempts: Math.max(0, MAX_LOGIN_ATTEMPTS - nextAttempts),
-      lockedUntil: lockedUntil,
-      remainingSeconds: lockedUntil ? Math.ceil(LOCKOUT_DURATION_MS / 1000) : 0
-    };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function clearLockout_(clientId) {
-  var key = normalizeClientKey_(clientId);
-  var map = getLockoutMap_();
-  if (map[key]) {
-    delete map[key];
-    saveLockoutMap_(map);
   }
 }
 
@@ -353,137 +163,24 @@ function saveStoredBranding_(branding) {
   return nextObj;
 }
 
-function readAllSheetsPublic_(ss, includeMaskedLogin) {
+function readAllSheetsPublic_(ss) {
   var sheets = ss.getSheets();
   var result = [];
   for (var i = 0; i < sheets.length; i++) {
-    var parsed = parseSingleSheet_(sheets[i]);
-    if (parsed.category === 'LOGIN' || String(parsed.name || '').toUpperCase() === 'LOGIN') {
-      if (includeMaskedLogin) {
-        result.push(maskLoginSheet_(parsed));
-      }
-    } else {
-      result.push(parsed);
-    }
+    if (isLoginSheetName_(sheets[i].getName())) continue;
+    result.push(parseSingleSheet_(sheets[i]));
   }
   return result;
 }
 
-function handleAuthLogin_(ss, body) {
-  var clientId = body.clientId || 'default';
-  var lockState = getLockStatus_(clientId);
-  if (lockState.locked) {
-    return {
-      ok: false,
-      status: 429,
-      locked: true,
-      attempts: lockState.attempts,
-      remainingAttempts: 0,
-      lockedUntil: lockState.lockedUntil,
-      remainingSeconds: lockState.remainingSeconds,
-      error: 'Bạn đã nhập sai quá 3 lần. Ứng dụng đã tạm đóng, vui lòng thử lại sau 1 giờ.'
-    };
-  }
-
-  var cleanUser = String(body.username || '').trim().toLowerCase();
-  var cleanPass = String(body.password || '').trim();
-  if (!cleanUser || !cleanPass) {
-    return {
-      ok: false,
-      status: 400,
-      locked: false,
-      attempts: lockState.attempts,
-      remainingAttempts: lockState.remainingAttempts,
-      error: 'Vui lòng nhập đầy đủ Tên đăng nhập và Mật khẩu.'
-    };
-  }
-
-  var loginSheet = findSheetCaseInsensitive_(ss, 'LOGIN');
-  if (!loginSheet) {
-    return {
-      ok: false,
-      status: 404,
-      error: 'Không tìm thấy tab LOGIN trong Google Sheet.'
-    };
-  }
-
-  var loginRows = parseSingleSheet_(loginSheet).rows || [];
-  var candidate = null;
-  for (var i = 0; i < loginRows.length; i++) {
-    if (String(loginRows[i].user || '').trim().toLowerCase() === cleanUser) {
-      candidate = loginRows[i];
-      break;
-    }
-  }
-
-  if (!candidate || !safeEqualStr_(String(candidate.password || '').trim(), cleanPass)) {
-    var failState = recordFailedAttempt_(clientId);
-    if (failState.locked) {
-      return {
-        ok: false,
-        status: 429,
-        locked: true,
-        attempts: failState.attempts,
-        remainingAttempts: 0,
-        lockedUntil: failState.lockedUntil,
-        remainingSeconds: failState.remainingSeconds,
-        error: 'Bạn đã nhập sai quá 3 lần. Ứng dụng đã tạm đóng, vui lòng thử lại sau 1 giờ.'
-      };
-    }
-    return {
-      ok: false,
-      status: 401,
-      locked: false,
-      attempts: failState.attempts,
-      remainingAttempts: failState.remainingAttempts,
-      error: 'Tên đăng nhập hoặc mật khẩu không chính xác. Còn ' + failState.remainingAttempts + ' lần thử trước khi ứng dụng khóa 1 giờ.'
-    };
-  }
-
-  if (candidate.role !== 'admin') {
-    var roleFail = recordFailedAttempt_(clientId);
-    if (roleFail.locked) {
-      return {
-        ok: false,
-        status: 429,
-        locked: true,
-        attempts: roleFail.attempts,
-        remainingAttempts: 0,
-        lockedUntil: roleFail.lockedUntil,
-        remainingSeconds: roleFail.remainingSeconds,
-        error: 'Bạn đã nhập sai quá 3 lần. Ứng dụng đã tạm đóng, vui lòng thử lại sau 1 giờ.'
-      };
-    }
-    return {
-      ok: false,
-      status: 403,
-      locked: false,
-      attempts: roleFail.attempts,
-      remainingAttempts: roleFail.remainingAttempts,
-      error: 'Chỉ tài khoản có ROLE = admin trên sheet LOGIN mới được đăng nhập. Còn ' + roleFail.remainingAttempts + ' lần thử.'
-    };
-  }
-
-  clearLockout_(clientId);
-  var authUser = {
-    id: candidate.stt,
-    name: candidate.name,
-    user: candidate.user,
-    role: 'admin'
-  };
-  var rememberMe = Boolean(body.rememberMe);
-  var token = signAdminToken_(authUser, rememberMe);
-  return {
-    ok: true,
-    token: token,
-    user: authUser,
-    rememberMe: rememberMe,
-    authSource: 'google-sheet-webhook'
-  };
+function getNonLoginSheetNames_(ss) {
+  return ss.getSheets()
+    .map(function(s) { return s.getName(); })
+    .filter(function(n) { return !isLoginSheetName_(n); });
 }
 
 /**
- * Xu ly GET request (ping, authStatus, authMe, getPublicData - ho tro CORS truc tiep tu GitHub Pages)
+ * Xu ly GET request (ping, getPublicData - ho tro CORS truc tiep tu GitHub Pages)
  */
 function doGet(e) {
   try {
@@ -504,46 +201,19 @@ function doGet(e) {
         version: CODE_GS_VERSION,
         spreadsheetName: ss.getName(),
         spreadsheetId: ss.getId(),
-        sheets: ss.getSheets().map(function(s) { return s.getName(); }),
+        sheets: getNonLoginSheetNames_(ss),
         timestamp: new Date().toISOString()
       });
     }
 
-    if (action === 'authStatus') {
-      var st = getLockStatus_(params.clientId || 'default');
-      return jsonResponse_({
-        ok: true,
-        locked: st.locked,
-        attempts: st.attempts,
-        remainingAttempts: st.remainingAttempts,
-        lockedUntil: st.lockedUntil,
-        remainingSeconds: st.remainingSeconds,
-        hasWebhook: true,
-        needsInitialSetup: false,
-        defaultSpreadsheetId: ss.getId(),
-        spreadsheetName: ss.getName(),
-        sheetCount: ss.getSheets().length
-      });
-    }
-
-    if (action === 'authMe') {
-      var verified = verifyAdminToken_(params.token || '');
-      if (!verified) {
-        return jsonResponse_({ ok: false, status: 401, error: 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn.' });
-      }
-      return jsonResponse_({ ok: true, user: verified.user });
-    }
-
     if (action === 'getPublicData') {
-      var adminSession = verifyAdminToken_(params.token || '');
-      var isAdmin = Boolean(adminSession);
       return jsonResponse_({
         ok: true,
         version: CODE_GS_VERSION,
         spreadsheetName: ss.getName(),
         spreadsheetId: ss.getId(),
         branding: getStoredBranding_(),
-        sheets: readAllSheetsPublic_(ss, isAdmin),
+        sheets: readAllSheetsPublic_(ss),
         timestamp: new Date().toISOString()
       });
     }
@@ -578,56 +248,30 @@ function doPost(e) {
         version: CODE_GS_VERSION,
         spreadsheetName: ss.getName(),
         spreadsheetId: ss.getId(),
-        sheets: ss.getSheets().map(function(s) { return s.getName(); }),
+        sheets: getNonLoginSheetNames_(ss),
         timestamp: new Date().toISOString()
       });
     }
 
-    if (action === 'authLogin') {
-      return jsonResponse_(handleAuthLogin_(ss, body));
-    }
-
-    if (action === 'authLogout') {
-      var logoutSess = verifyAdminToken_(body.token || '');
-      if (logoutSess) {
-        revokeTokenId_(logoutSess.jti, logoutSess.exp);
-      }
-      return jsonResponse_({ ok: true });
-    }
-
     if (action === 'getPublicData') {
-      var pubAdmin = verifyAdminToken_(body.token || '');
       return jsonResponse_({
         ok: true,
         version: CODE_GS_VERSION,
         spreadsheetName: ss.getName(),
         spreadsheetId: ss.getId(),
         branding: getStoredBranding_(),
-        sheets: readAllSheetsPublic_(ss, Boolean(pubAdmin)),
+        sheets: readAllSheetsPublic_(ss),
         timestamp: new Date().toISOString()
       });
     }
 
-    // Cac action ben duoi YEU CAU Admin Token hop le
-    var adminSession = verifyAdminToken_(body.token || '');
+    // Cac action ben duoi YEU CAU phien Admin Firebase hop le
+    var adminSession = verifyFirebaseAdminSession_(body.firebaseSessionId || '');
     if (!adminSession) {
       return jsonResponse_({
         ok: false,
         status: 401,
-        error: 'Chưa xác thực Admin hoặc phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.'
-      });
-    }
-
-    if (action === 'authTestLogin') {
-      var lSheet = findSheetCaseInsensitive_(ss, 'LOGIN');
-      var lRows = lSheet ? (parseSingleSheet_(lSheet).rows || []) : [];
-      return jsonResponse_({
-        ok: true,
-        source: 'webhook',
-        count: lRows.length,
-        accounts: lRows.map(function(r) {
-          return { stt: r.stt, name: r.name, user: r.user, role: r.role };
-        })
+        error: 'Chưa xác thực Admin Firebase hoặc phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.'
       });
     }
 
@@ -646,30 +290,33 @@ function doPost(e) {
         spreadsheetName: ss.getName(),
         spreadsheetId: ss.getId(),
         branding: getStoredBranding_(),
-        sheets: readAllSheetsPublic_(ss, true),
+        sheets: readAllSheetsPublic_(ss),
         timestamp: new Date().toISOString()
       });
     }
 
     if (action === 'getSheet' && body.sheetName) {
+      if (isLoginSheetName_(body.sheetName)) {
+        return jsonResponse_({ ok: false, status: 403, error: 'Tab LOGIN không được phép truy cập qua API.' });
+      }
       var targetSheet = findSheetCaseInsensitive_(ss, body.sheetName);
       if (!targetSheet) {
         return jsonResponse_({ ok: false, status: 404, error: 'Không tìm thấy sheet: ' + body.sheetName });
       }
       return jsonResponse_({
         ok: true,
-        sheet: maskLoginSheet_(parseSingleSheet_(targetSheet))
+        sheet: parseSingleSheet_(targetSheet)
       });
     }
 
     if (action === 'createSheet') {
       var sheetDoc = body.sheet;
-      if (!sheetDoc || !sheetDoc.name) {
-        return jsonResponse_({ ok: false, status: 400, error: 'Thiếu thông tin sheet.' });
+      if (!sheetDoc || !sheetDoc.name || isLoginSheetName_(sheetDoc.name)) {
+        return jsonResponse_({ ok: false, status: 400, error: 'Tên sheet không hợp lệ.' });
       }
       writeSheetDocument_(ss, sheetDoc, true);
       var createdSheet = findSheetCaseInsensitive_(ss, sheetDoc.name);
-      var parsedCreated = createdSheet ? maskLoginSheet_(parseSingleSheet_(createdSheet)) : sheetDoc;
+      var parsedCreated = createdSheet ? parseSingleSheet_(createdSheet) : sheetDoc;
       return jsonResponse_({
         ok: true,
         message: 'Đã tạo sheet ' + sheetDoc.name,
@@ -679,15 +326,15 @@ function doPost(e) {
 
     if (action === 'syncSheet') {
       var doc = body.sheet;
-      if (!doc || !doc.name) {
-        return jsonResponse_({ ok: false, status: 400, error: 'Thiếu dữ liệu sheet.' });
+      if (!doc || !doc.name || isLoginSheetName_(doc.name)) {
+        return jsonResponse_({ ok: false, status: 400, error: 'Dữ liệu sheet không hợp lệ.' });
       }
       writeSheetDocument_(ss, doc, false);
       return jsonResponse_({ ok: true, message: 'Đã đồng bộ sheet ' + doc.name });
     }
 
     if (action === 'syncAll') {
-      var sheets = body.sheets || [];
+      var sheets = (body.sheets || []).filter(function(s) { return s && s.name && !isLoginSheetName_(s.name); });
       for (var i = 0; i < sheets.length; i++) {
         writeSheetDocument_(ss, sheets[i], false);
       }
@@ -700,8 +347,11 @@ function doPost(e) {
 
     if (action === 'deleteSheet') {
       var nameToDelete = body.sheetName;
+      if (isLoginSheetName_(nameToDelete) || String(nameToDelete || '').toUpperCase().trim() === 'DSHO') {
+        return jsonResponse_({ ok: false, status: 400, error: 'Không thể xóa sheet này.' });
+      }
       var target = findSheetCaseInsensitive_(ss, nameToDelete);
-      if (target && String(nameToDelete).toUpperCase() !== 'LOGIN' && String(nameToDelete).toUpperCase() !== 'DSHO') {
+      if (target) {
         ss.deleteSheet(target);
       }
       return jsonResponse_({ ok: true, message: 'Đã xóa sheet ' + nameToDelete });
@@ -720,7 +370,6 @@ function doPost(e) {
  */
 function detectCategory_(name) {
   var upper = String(name).toUpperCase().trim();
-  if (upper === 'LOGIN') return 'LOGIN';
   if (upper === 'DSHO') return 'DSHO';
   if (upper.indexOf('VAY') === 0) return 'VAY';
   if (upper.indexOf('GOP') === 0) return 'GOP';
@@ -756,12 +405,7 @@ function sanitizeSheetCell_(val) {
 }
 
 function readAllSheets_(ss) {
-  var sheets = ss.getSheets();
-  var result = [];
-  for (var i = 0; i < sheets.length; i++) {
-    result.push(parseSingleSheet_(sheets[i]));
-  }
-  return result;
+  return readAllSheetsPublic_(ss);
 }
 
 function parseSingleSheet_(sheet) {
@@ -769,44 +413,6 @@ function parseSingleSheet_(sheet) {
   var category = detectCategory_(name);
   var year = extractYear_(name);
   var values = sheet.getDataRange().getValues();
-
-  if (category === 'LOGIN') {
-    var headers = values[0] || [];
-    var colId = 0, colName = 1, colUser = 2, colPass = 3, colRole = 4;
-    for (var h = 0; h < headers.length; h++) {
-      var key = String(headers[h] || '').toUpperCase().trim();
-      if (key === 'ID' || key === 'STT') colId = h;
-      else if (key === 'NAME' || key === 'HỌ TÊN' || key === 'HỌ VÀ TÊN') colName = h;
-      else if (key === 'USER' || key === 'USERNAME' || key === 'TÀI KHOẢN') colUser = h;
-      else if (key === 'PASSWORD' || key === 'PASS' || key === 'MẬT KHẨU') colPass = h;
-      else if (key === 'ROLE' || key === 'QUYỀN') colRole = h;
-    }
-
-    var loginRows = [];
-    for (var r = 1; r < values.length; r++) {
-      var row = values[r];
-      var uVal = row[colUser] !== undefined && row[colUser] !== null ? String(row[colUser]).trim() : '';
-      var nVal = row[colName] !== undefined && row[colName] !== null ? String(row[colName]).trim() : '';
-      if (!uVal && !nVal) continue;
-      var pVal = row[colPass] !== undefined && row[colPass] !== null ? String(row[colPass]).trim() : '';
-      var roleVal = row[colRole] !== undefined && row[colRole] !== null ? String(row[colRole]).trim().toLowerCase() : 'user';
-      loginRows.push({
-        id: 'login-' + r,
-        stt: toNumber_(row[colId]) || (loginRows.length + 1),
-        name: nVal,
-        user: uVal,
-        password: pVal,
-        role: roleVal === 'admin' ? 'admin' : 'user'
-      });
-    }
-    return {
-      name: name,
-      category: 'LOGIN',
-      title: 'QUẢN LÝ TÀI KHOẢN ĐĂNG NHẬP',
-      isCore: true,
-      rows: loginRows
-    };
-  }
 
   if (category === 'DSHO') {
     var dshoRows = [];
@@ -975,55 +581,9 @@ function parseSingleSheet_(sheet) {
  * ============================================================================
  */
 function writeSheetDocument_(ss, doc, failIfExists) {
+  if (!doc || !doc.name || isLoginSheetName_(doc.name)) return;
   var sheet = findSheetCaseInsensitive_(ss, doc.name);
   var cat = doc.category;
-
-  if (cat === 'LOGIN') {
-    var existingPassByUser = {};
-    var existingPassByRowId = {};
-    if (sheet && sheet.getLastRow() > 1) {
-      var oldVals = sheet.getDataRange().getValues();
-      var hdr = oldVals[0] || [];
-      var cUser = 2, cPass = 3;
-      for (var hi = 0; hi < hdr.length; hi++) {
-        var hk = String(hdr[hi] || '').toUpperCase().trim();
-        if (hk === 'USER' || hk === 'USERNAME' || hk === 'TÀI KHOẢN') cUser = hi;
-        else if (hk === 'PASSWORD' || hk === 'PASS' || hk === 'MẬT KHẨU') cPass = hi;
-      }
-      for (var er = 1; er < oldVals.length; er++) {
-        var oldPass = oldVals[er][cPass] !== undefined && oldVals[er][cPass] !== null ? String(oldVals[er][cPass]) : '';
-        existingPassByRowId['login-' + er] = oldPass;
-        var oldU = String(oldVals[er][cUser] || '').trim().toLowerCase();
-        if (oldU) {
-          existingPassByUser[oldU] = oldPass;
-        }
-      }
-    }
-    if (!sheet) {
-      sheet = ss.insertSheet(doc.name);
-    } else {
-      sheet.clear();
-    }
-    sheet.getRange(1, 1, 1, 5).setValues([['ID', 'NAME', 'USER', 'PASSWORD', 'ROLE']]).setFontWeight('bold');
-    var rows = (doc.rows || []).map(function(r, idx) {
-      var uKey = String(r.user || '').trim().toLowerCase();
-      var prevUKey = String(r.prevUser || '').trim().toLowerCase();
-      var incomingPass = r.password ? String(r.password) : '';
-      var preservedPass = existingPassByUser[uKey] || (prevUKey ? existingPassByUser[prevUKey] : '') || existingPassByRowId[r.id] || '';
-      var finalPass = (incomingPass && incomingPass !== '••••••••') ? incomingPass : preservedPass;
-      return [
-        r.stt || (idx + 1),
-        sanitizeSheetCell_(r.name || ''),
-        sanitizeSheetCell_(r.user || ''),
-        sanitizeSheetCell_(finalPass),
-        sanitizeSheetCell_(r.role || 'user')
-      ];
-    });
-    if (rows.length > 0) {
-      sheet.getRange(2, 1, rows.length, 5).setValues(rows);
-    }
-    return;
-  }
 
   if (sheet && failIfExists) {
     sheet.clear();
